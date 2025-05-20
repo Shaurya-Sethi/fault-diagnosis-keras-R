@@ -1,0 +1,950 @@
+---
+title: "Fault Diagnosis Using Neural Networks: A Development Pipeline"
+author: "Shaurya Sethi"
+format: pdf
+editor: visual
+execute:
+  freeze: auto
+  eval: false
+---
+
+## Introduction
+
+Fault diagnosis in analog electronic circuits is a critical task in ensuring the reliability and safety of modern electronic systems. Traditional diagnostic methods often rely on manual inspection or rule-based approaches, which can be time-consuming, error-prone, and difficult to scale. With the increasing complexity of circuit designs, there is a growing need for automated, data-driven solutions capable of accurately identifying fault conditions.
+
+This project presents a machine learning–based approach to fault classification using features extracted from a simulated analog circuit. The dataset was generated using **Multisim** simulations and includes a range of normal and faulty circuit conditions. A multi-layer perceptron (MLP) model was developed and prototyped using **R with Keras and TensorFlow**, followed by a more advanced implementation in **PyTorch**. The final model demonstrates high diagnostic accuracy and has been deployed as an interactive web application for real-time fault detection.
+
+**Why R Was Used for Prototyping**
+
+R was chosen for the initial prototyping phase due to its strengths in **data preprocessing**, **exploratory data analysis (EDA)**, and rapid development. The R ecosystem offers intuitive and powerful tools for data manipulation, making it well-suited for preparing complex simulation data. Additionally, the **Keras interface in R** provides a high-level abstraction for building neural networks, allowing for quick experimentation without managing low-level implementation details. This enabled efficient iteration during the early stages of model development.
+
+![](images/clipboard-10405690.png)
+
+## Data Preprocessing
+
+### Preliminary Data Exploration and Cleaning
+
+First load the required libraries
+
+```{r}
+library(tidyverse)   # For data manipulation and visualization
+library(dplyr)       # For data wrangling
+library(ggplot2)     # For visualizations
+library(corrplot)    # For correlation analysis
+library(skimr)       # For EDA summary
+library(readxl)      # For reading Excel files
+```
+
+Read the excel file into a `dataframe` for manipulating and transforming data efficiently.
+
+```{r}
+file_path <- "time_features_extracted_dataset.xlsx"
+df <- read_xlsx(file_path)
+head(df,5)  # check the dataset structure
+```
+
+![](images/clipboard-2101662662.png)
+
+Removing source and file columns as not required - Those were introduced initially to make it convenient for me to tally where the data was extracted from.
+
+```{r}
+df <- df %>% select(-source, -file)
+str(df)
+```
+
+```         
+tibble [714 × 11] (S3: tbl_df/tbl/data.frame)
+$ mean    : num [1:714] 0.001112 -0.000204 0.000681 -0.073685 -0.000285 ...  
+$ std     : num [1:714] 0.347 0.767 0.484 12.851 0.449 ...  
+$ max     : num [1:714] 0.493 1.088 0.687 13.008 0.635 ...  
+$ min     : num [1:714] -0.491 -1.088 -0.686 -13.011 -0.636 ...  
+$ median  : num [1:714] 6.90e-04 -2.47e-04 2.47e-04 -2.04 -5.66e-05 ...  
+$ ptp     : num [1:714] 0.984 2.175 1.373 26.019 1.27 ...  
+$ skewness: num [1:714] -3.05e-04 2.17e-04 -7.86e-05 1.29e-02 -1.36e-04 ...  
+$ kurtosis: num [1:714] -1.5 -1.5 -1.5 -1.98 -1.5 ...  
+$ rms     : num [1:714] 0.347 0.767 0.484 12.851 0.449 ...  
+$ zcr     : num [1:714] 0.0996 0.0996 0.0996 0.1006 0.0996 ...  
+$ label   : chr [1:714] "SK_Biasing" "SK_Biasing" "SK_Biasing" "SK_Biasing" ...
+```
+
+Convert label to factor as it is a categorical variable and represents the target for the classification.
+
+```{r}
+df$label <- as.factor(df$label) 
+```
+
+Checking for missing values - In case the python script responsible for extracting statistical features from the raw waveform data was not successful in some cases.
+
+```{r}
+colSums(is.na(df))
+```
+
+```         
+mean      std      max      min   median      ptp skewness kurtosis      rms      zcr    label         0        0        0        0        0        0        0        0        0        0        0 
+```
+
+No missing values -\> That's good. Now I check the class distribution to ensure a balanced representation of each fault class -\> This prevents the model from favoring certain classes over the others.
+
+```{r}
+### check class distribution
+df %>%
+  group_by(label) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count)) # dataset is balanced
+
+### visualising class distribution
+ggplot(df, aes(x = label, fill = factor(label))) +
+  geom_bar(color = "black") +
+  theme_minimal() +
+  labs(title = "Class Distribution of Fault Types",
+       x = "Fault Type",
+       y = "Count",
+       fill = "Fault Type") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+![](images/clipboard-3429039434.png)
+
+There are roughly a 100 samples available each class. At first glance the **dataset looks balanced**, however after careful experimentation and initial prototyping, I found that the model was misclassifying Normal operation very frequently.
+
+From a different perspective, Normal operation has about a 100 samples, and all the other individual fault classes add up to 600 samples of faulty operation data -\> So in practice, the dataset is imbalanced.
+
+Later I will apply **controlled SMOTE** to increase the number of samples for SK_Normal.
+
+### Feature Engineering
+
+Initial prototyping did not yield optimal results because of redundancy in some features, and because the current selection of features is unable to capture the waveform distributions properly.
+
+So I construct new features and analyse correlation between the features to identify redundancies and drop the ones that do not contribute any meaningful information to the dataset.
+
+**Initial correlation analysis**
+
+```{r}
+# Compute correlation (excluding the 'label' column)
+cor_matrix <- cor(df %>% select(-label))
+
+# Plot a correlation heatmap
+corrplot::corrplot(cor_matrix, 
+                   method = "color",  # Use color shading
+                   type = "full",  # Show full matrix instead of upper triangle
+                   tl.col = "black",  # Set text color
+                   tl.srt = 45,  # Rotate labels for better readability
+                   diag = TRUE,  # Show diagonal values
+                   addCoef.col = "black",  # Add correlation values in black text
+                   number.cex = 0.75)  # Adjust text size
+```
+
+![](images/clipboard-3084099116.png)
+
+`skewness` and `kurtosis` are very negatively correlated -\> candidates for transformation and removal. `mean` , `median`, and `max` are also highly correlated and lead to redundancy so I try to engineer new features from these as well.
+
+```{r}
+df <- df %>% 
+  mutate(
+    skew_kurt_ratio = skewness / kurtosis,
+    var = (rms^2 - median^2),  # Approximate variance from existing features
+    crest_factor = max / rms,  # Crest Factor
+    shape_factor = rms / abs(median),  # Shape Factor
+    impulse_factor = max / abs(median),  # Impulse Factor
+    )
+
+str(df)  # to verify if it worked
+colSums(is.na(df))
+```
+
+```         
+tibble [714 × 16] (S3: tbl_df/tbl/data.frame)  
+$ mean           : num [1:714] 0.001112 -0.000204 0.000681 -0.073685 -0.000285 ...  
+$ std            : num [1:714] 0.347 0.767 0.484 12.851 0.449 ...  
+$ max            : num [1:714] 0.493 1.088 0.687 13.008 0.635 ...  
+$ min            : num [1:714] -0.491 -1.088 -0.686 -13.011 -0.636 ...  
+$ median         : num [1:714] 6.90e-04 -2.47e-04 2.47e-04 -2.04 -5.66e-05 ...  
+$ ptp            : num [1:714] 0.984 2.175 1.373 26.019 1.27 ...  
+$ skewness       : num [1:714] -3.05e-04 2.17e-04 -7.86e-05 1.29e-02 -1.36e-04 ...  
+$ kurtosis       : num [1:714] -1.5 -1.5 -1.5 -1.98 -1.5 ...  
+$ rms            : num [1:714] 0.347 0.767 0.484 12.851 0.449 ...  
+$ zcr            : num [1:714] 0.0996 0.0996 0.0996 0.1006 0.0996 ...  
+$ label          : Factor w/ 7 levels "SK_Biasing","SK_Drifts",..: 1 1 1 1 1 1 1 1 1 1 ...  
+$ skew_kurt_ratio: num [1:714] 2.04e-04 -1.45e-04 5.25e-05 -6.50e-03 9.05e-05 ...  
+$ var            : num [1:714] 0.121 0.588 0.234 160.982 0.202 ...  
+$ crest_factor   : num [1:714] 1.42 1.42 1.42 1.01 1.41 ...  
+$ shape_factor   : num [1:714] 503.17 3107.41 1960.4 6.29 7940.63 ...  
+$ impulse_factor : num [1:714] 714.07 4407.95 2782.86 6.37 11224.1 ...
+```
+
+```         
+ mean             std             max             min          median             ptp                0               0               0               0               0               0         skewness        kurtosis             rms             zcr           label skew_kurt_ratio                0               0               0               0               0              25              var    crest_factor    shape_factor  impulse_factor                0              25              25              25 
+```
+
+There are 25 missing values across most of our newly engineered features. Viewing how the features were constructed, all of them are a result of some sort of division, and so it could be possible that division by 0 is leading to the creation of these nans.
+
+I introduce a small constant `1e-6` in the denominator to prevent division by zero and recompute the features instead of dropping the rows corresponding to the missing data because of data insufficiency for a neural network.
+
+```{r}
+df <- df %>% 
+  select(-skew_kurt_ratio, -crest_factor, -shape_factor, -impulse_factor) %>%
+  mutate(skew_kurt_ratio = skewness / (kurtosis + 1e-6),
+         crest_factor = max / (rms + 1e-6),  # Crest Factor
+         shape_factor = rms / (abs(median) + 1e-6),  # Shape Factor
+         impulse_factor = max / (abs(median) + 1e-6),  # Impulse Factor
+         )
+
+df <- df %>%
+  select(-label, everything(), label)  # to ensure label is last column
+
+str(df)  # to verify if it worked
+colSums(is.na(df))
+```
+
+![](images/clipboard-3611293629.png)
+
+That fixes the problem as can be seen in the output. No more missing values.
+
+**Correlation analysis**
+
+```{r}
+# Compute correlation (excluding the 'label' column)
+cor_matrix_v2 <- cor(df %>% select(-label))
+
+# Plot a correlation heatmap
+corrplot::corrplot(cor_matrix_v2, 
+                   method = "color",  # Use color shading
+                   type = "full",  # Show full matrix instead of upper triangle
+                   tl.col = "black",  # Set text color
+                   tl.srt = 45,  # Rotate labels for better readability
+                   diag = TRUE,  # Show diagonal values
+                   addCoef.col = "black",  # Add correlation values in black text
+                   number.cex = 0.75)  # Adjust text size
+```
+
+![](images/clipboard-1223768800.png)
+
+Analysing this correlation matrix, I arrived at the following decisions with respect to what features to remove and what new features to construct again.
+
+```{r}
+# engineering new features first
+
+df <- df %>% mutate(skew_kurt_product = skewness * kurtosis,
+                    std_min_ratio = abs(std / (min + 1e-6)),
+                    min_ptp_ratio = min / (ptp + 1e-6))
+
+
+# dropping some features 
+
+df <- df %>% select(-mean, -std, -max, -impulse_factor, -skewness, -kurtosis)
+head(df, 3)
+```
+
+```{r}
+# Compute correlation (excluding the 'label' column) AGAIN!!
+cor_matrix_v3 <- cor(df %>% select(-label))
+
+# Plot a correlation heatmap
+corrplot::corrplot(cor_matrix_v3, 
+                   method = "color",  # Use color shading
+                   type = "full",  # Show full matrix instead of upper triangle
+                   tl.col = "black",  # Set text color
+                   tl.srt = 45,  # Rotate labels for better readability
+                   diag = TRUE,  # Show diagonal values
+                   addCoef.col = "black",  # Add correlation values in black text
+                   number.cex = 0.75)  # Adjust text size
+
+# ptp and rms are very highly correlated.
+# I drop rms because ptp holds useful information about the total energy of the signal
+
+df <- df %>% select(-rms)
+```
+
+![](images/clipboard-1991441670.png)
+
+Viewing the dataset again
+
+```{r}
+str(df)
+```
+
+```         
+tibble [714 × 12] (S3: tbl_df/tbl/data.frame)  
+$ min              : num [1:714] -0.491 -1.088 -0.686 -13.011 -0.636 ...  
+$ median           : num [1:714] 6.90e-04 -2.47e-04 2.47e-04 -2.04 -5.66e-05 ...  
+$ ptp              : num [1:714] 0.984 2.175 1.373 26.019 1.27 ... 
+$ zcr              : num [1:714] 0.0996 0.0996 0.0996 0.1006 0.0996 ...  
+$ var              : num [1:714] 0.121 0.588 0.234 160.982 0.202 ...  
+$ skew_kurt_ratio  : num [1:714] 2.04e-04 -1.45e-04 5.25e-05 -6.50e-03 9.05e-05 ...  
+$ crest_factor     : num [1:714] 1.42 1.42 1.42 1.01 1.41 ...  
+$ shape_factor     : num [1:714] 502.44 3094.87 1952.49 6.29 7802.69 ...  
+$ label            : Factor w/ 7 levels "SK_Biasing","SK_Drifts",..: 1 1 1 1 1 1 1 1 1 1 ...  
+$ skew_kurt_product: num [1:714] 0.000457 -0.000326 0.000118 -0.025499 0.000203 ...  
+$ std_min_ratio    : num [1:714] 0.708 0.705 0.706 0.988 0.707 ...  
+$ min_ptp_ratio    : num [1:714] -0.499 -0.5 -0.499 -0.5 -0.5 ...
+```
+
+```{r}
+df <- df %>%
+  select(-label, everything(), label)  # to ensure label is last column
+```
+
+### Outlier detection and handling
+
+Outliers can be detrimental to the performance of a multi-layer perceptron and need to be identified and handled gracefully. In this section I do the same by using the Interquartile Range method to identify them and winsorization to handle them.
+
+```{r}
+# Count outliers using IQR method
+iqr_outliers <- df %>%
+  summarise(across(where(is.numeric), ~ sum(. < (quantile(., 0.25) - 1.5 * IQR(.)) | 
+                                              . > (quantile(., 0.75) + 1.5 * IQR(.)))))
+
+# Print number of outliers per feature
+print(iqr_outliers) # many outliers -> need to be handled
+```
+
+![](images/clipboard-520328511.png)
+
+Clearly, there are many outliers present across a wide range of features but now that they have been identified they can be handled properly.
+
+```{r}
+# - option A : Winsorization -> to cap them at IQR*1.5 
+# - option B : Robust scaling -> extreme values, even after scaling can adversely affect MLP
+
+# Applying winsorization :
+
+# Function to cap outliers at 1.5 * IQR range
+cap_outliers <- function(x) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  pmin(pmax(x, q1 - 1.5 * iqr), q3 + 1.5 * iqr)  # Capping values
+}
+
+# Apply Winsorization to all numeric features
+df <- df %>%
+  mutate(across(where(is.numeric), cap_outliers))
+
+# Verify if outliers are reduced
+iqr_outliers_after <- df %>%
+  summarise(across(where(is.numeric), ~ sum(. < (quantile(., 0.25) - 1.5 * IQR(.)) | 
+                                              . > (quantile(., 0.75) + 1.5 * IQR(.)))))
+print(iqr_outliers_after)
+```
+
+![](images/clipboard-2338024920.png)
+
+No more outliers remain in our dataset and it is now almost ready to be used for training. I save this dataset and as hinted above, I apply controlled SMOTE on it to increase the representation of Normal operation samples in the dataset using a python script.
+
+```{r}
+# Define file path
+mlp_file_path <- "C:/Users/shaur/OneDrive/Desktop/TD_features_MLP_V2.csv"
+
+# Save df (for MLP)
+write.csv(df, mlp_file_path, row.names = FALSE)
+
+# Confirm success
+cat("Dataset successfully saved to Desktop:\n",
+    "- MLP: ", mlp_file_path, "\n")
+```
+
+## One-Way ANOVA for Testing Feature Differences by Fault Label
+
+To evaluate the statistical relationship between each numeric feature and the fault categories, a one-way ANOVA test was conducted. Each fault type (e.g., *SK_Biasing*, *SK_Normal*, *SK_Drifts*, etc.) was treated as a distinct group, and the test assessed whether the mean of a given feature differed significantly across these groups.
+
+I **Load the libraries** and the dataset to conduct ANOVA on.
+
+```{r}
+library(tidyverse)
+library(readr)
+data <- read_csv("smote_balanced_TD_features_MLP_V2.csv")
+```
+
+Then I **define a function** to conduct ANOVA across all the features in the dataset.
+
+```{r}
+run_anova_for_all_features <- function(data, label_col = "label", plot = FALSE) {
+  cat("Running one-way ANOVA for all numeric features vs.", label_col, "\n\n")
+  
+  # Ensure label column is factor
+  data[[label_col]] <- as.factor(data[[label_col]])
+  
+  # Identify numeric features (excluding the label column)
+  num_features <- data %>% 
+    select(where(is.numeric)) %>%
+    select(-one_of(label_col)) %>%
+    names()
+  
+  # Loop through features
+  for (feature in num_features) {
+    formula <- as.formula(paste(feature, "~", label_col))
+    result <- summary(aov(formula, data = data))
+    p_val <- result[[1]][["Pr(>F)"]][1]
+    
+    #cat(sprintf("Feature: %-20s | p-value: %.5f\n", feature, p_val))
+    cat(sprintf("Feature: %-22s | p-value: %.5e\n", feature, p_val))
+    
+    
+    # plot boxplot
+    if (plot) {
+      p <- ggplot(data, aes_string(x = label_col, y = feature, fill = label_col)) +
+        geom_boxplot() +
+        labs(title = paste("Boxplot of", feature, "by", label_col),
+             x = "Fault Type", y = feature) +
+        theme_minimal() +
+        theme(legend.position = "none")
+      print(p)
+    }
+  }
+}
+```
+
+I then **call the function** to get test results
+
+```{r}
+run_anova_for_all_features(data, plot = FALSE)
+```
+
+```         
+Running one-way ANOVA for all numeric features vs. label  
+Warning: Unknown columns: `label` 
+Feature: min                    | p-value: 8.98218e-93 
+Feature: median                 | p-value: 4.65729e-105 
+Feature: ptp                    | p-value: 1.30441e-25 
+Feature: rms                    | p-value: 2.65444e-17 
+Feature: zcr                    | p-value: 5.02297e-109 
+Feature: var                    | p-value: 1.32881e-129 
+Feature: skew_kurt_ratio        | p-value: 7.24227e-95 
+Feature: crest_factor           | p-value: 1.68881e-228 
+Feature: shape_factor           | p-value: 7.17199e-38 
+Feature: skew_kurt_product      | p-value: 2.27238e-82 
+Feature: std_min_ratio          | p-value: 3.06741e-216 
+Feature: min_ptp_ratio          | p-value: 2.10763e-257
+```
+
+### Results Summary
+
+The p-values obtained for all features were exceptionally small, ranging from approximately 1e-17 to 1e-257. These values are well below the standard significance threshold of 0.05, indicating strong statistical evidence against the null hypothesis. We therefore reject the null hypothesis for all features and conclude that the mean values of each numeric feature differ significantly across fault classes.
+
+**This outcome suggests that each feature contains valuable discriminative information for distinguishing between fault types. The ANOVA results provide statistical justification for the inclusion of these features in machine learning models for fault classification.**
+
+Below is an example plot if `plot` was set to `TRUE` instead.
+
+![](images/clipboard-3929863579.png)
+
+**Figure:** Boxplot of the `shape_factor` feature grouped by fault type. The distribution of this feature varies significantly across categories, with certain fault classes (e.g., *SK_OpenR*, *SK_ShortCap*) showing near-zero values, and others (e.g., *SK_Biasing*, *SK_InputFaults*) exhibiting wider spreads. This supports the conclusion that `shape_factor` is a statistically significant feature for fault classification.
+
+## 
+
+## Building the Multi-Layer Perceptron
+
+### Model architecture and training
+
+First I load the required libraries.
+
+```{r}
+# Load necessary libraries
+library(keras)
+library(tensorflow)
+library(caret)    # For confusionMatrix and classification report
+library(ggplot2)  # For the confusion matrix plot
+
+# Set seed for reproducibility
+set.seed(123)
+```
+
+Then I load and preprocess the data
+
+```{r}
+# 1. Data Loading and Preprocessing
+# ----------------------------------
+data <- read.csv("smote_balanced_TD_features_MLP_V2.csv")
+
+# Assume the last column is the categorical target and the first 12 columns are numeric features.
+num_features <- ncol(data) - 1
+features <- data[, 1:num_features]
+target <- data[, ncol(data)]
+
+# Standardize numeric columns (zero mean, unit variance)
+features_scaled <- scale(features)
+
+# Encode the categorical target variable
+target_factor <- as.factor(target)
+target_int <- as.integer(target_factor) - 1  # Zero-index adjustment
+num_classes <- length(levels(target_factor))
+target_onehot <- to_categorical(target_int, num_classes = num_classes)
+```
+
+Now creating the training, validation, and test splits.
+
+```{r}
+# 2. Data Splitting
+# -----------------
+n <- nrow(data)
+indices <- sample(1:n)
+train_end <- floor(0.8 * n)
+val_end <- floor(0.9 * n)
+
+train_idx <- indices[1:train_end]
+val_idx   <- indices[(train_end + 1):val_end]
+test_idx  <- indices[(val_end + 1):n]
+
+x_train <- features_scaled[train_idx, ]
+x_val   <- features_scaled[val_idx, ]
+x_test  <- features_scaled[test_idx, ]
+
+y_train <- target_onehot[train_idx, ]
+y_val   <- target_onehot[val_idx, ]
+y_test  <- target_onehot[test_idx, ]
+```
+
+The diagnostic model was implemented as a deep feedforward neural network (multi-layer perceptron) using the **Keras interface in R**. The architecture comprises four hidden layers with progressively structured units: 128, 256, 128, and 64 neurons respectively. Each layer is followed by **batch normalization** to stabilize and accelerate training, **Leaky ReLU activation** (with a small negative slope of 0.1) to mitigate the dying ReLU problem, and **dropout regularization** (20%) to prevent overfitting by randomly deactivating neurons during training. To ensure robust weight initialization, all layers use the **He normal initializer**, which is well-suited for activation functions like ReLU. Additionally, **L2 regularization** is applied to each dense layer to further constrain weight magnitudes and reduce model variance. The final output layer uses a **softmax activation** to produce class probabilities across the fault categories. To encourage smoother class predictions and reduce overconfidence, the model is trained using a **categorical cross-entropy loss with label smoothing**. Optimization is performed using the **Adam optimizer** with a learning rate of 0.001, and both loss and accuracy are monitored during training. This architecture balances complexity and regularization, making it well-suited for capturing nonlinear patterns in fault diagnosis while mitigating overfitting on the limited dataset.
+
+```{r}
+# 3. Model Architecture
+# ---------------------
+model <- keras_model_sequential() %>%
+  layer_dense(units = 128, 
+              input_shape = c(num_features),
+              kernel_initializer = initializer_he_normal(),
+              kernel_regularizer = regularizer_l2(0.001)) %>%
+  layer_batch_normalization() %>%
+  layer_activation_leaky_relu(alpha = 0.1) %>%
+  layer_dropout(rate = 0.2) %>%
+  
+  layer_dense(units = 256, 
+              kernel_initializer = initializer_he_normal(),
+              kernel_regularizer = regularizer_l2(0.001)) %>%
+  layer_batch_normalization() %>%
+  layer_activation_leaky_relu(alpha = 0.1) %>%
+  layer_dropout(rate = 0.2) %>%
+  
+  layer_dense(units = 128, 
+              kernel_initializer = initializer_he_normal(),
+              kernel_regularizer = regularizer_l2(0.001)) %>%
+  layer_batch_normalization() %>%
+  layer_activation_leaky_relu(alpha = 0.1) %>%
+  layer_dropout(rate = 0.2) %>%
+  
+  layer_dense(units = 64,
+              kernel_initializer = initializer_he_normal(),
+              kernel_regularizer = regularizer_l2(0.001)) %>%
+  layer_batch_normalization() %>%
+  layer_activation_leaky_relu(alpha = 0.1) %>%
+  
+  layer_dense(units = num_classes, activation = "softmax")
+
+# Use a loss function with label smoothing to reduce overconfidence.
+loss_obj <- tf$keras$losses$CategoricalCrossentropy(label_smoothing = 0.1)
+
+# Compile the model: we now track both loss and accuracy.
+model %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  loss = loss_obj,
+  metrics = c("accuracy")
+)
+```
+
+Callbacks and visualization
+
+```{r}
+# 4. Callbacks for Training
+# --------------------------
+# Learning Rate Scheduler: Reduce LR on Plateau
+lr_scheduler <- callback_reduce_lr_on_plateau(
+  monitor = "val_loss",    # Monitor validation loss
+  factor = 0.5,            # Reduce LR by half
+  patience = 10,           # Wait for 10 epochs with no improvement
+  min_lr = 1e-4,           # Do not reduce LR below this value
+  verbose = 1
+)
+
+# Containers to store metrics
+loss_history <- c()
+val_loss_history <- c()
+accuracy_history <- c()
+val_accuracy_history <- c()
+lr_history <- c()
+
+# Custom callback to track and plot metrics (loss, accuracy, learning rate)
+callback_plot_metrics <- callback_lambda(
+  on_epoch_end = function(epoch, logs) {
+    # (Training mode is automatically active during fit(); this call is extra assurance)
+    k_set_learning_phase(1)
+    
+    loss_history <<- c(loss_history, logs[["loss"]])
+    val_loss_history <<- c(val_loss_history, logs[["val_loss"]])
+    accuracy_history <<- c(accuracy_history, logs[["accuracy"]])
+    val_accuracy_history <<- c(val_accuracy_history, logs[["val_accuracy"]])
+    current_lr <- k_get_value(model$optimizer$lr)
+    lr_history <<- c(lr_history, current_lr)
+    
+    # Plot metrics in a 1x3 grid: Loss, Accuracy, Learning Rate
+    par(mfrow = c(1, 3))
+    
+    # Loss plot
+    plot(1:length(loss_history), loss_history, type = "l", col = "blue",
+         ylim = range(c(loss_history, val_loss_history)),
+         xlab = "Epoch", ylab = "Loss", main = "Loss")
+    lines(1:length(val_loss_history), val_loss_history, col = "red")
+    legend("topright", legend = c("Train Loss", "Val Loss"), col = c("blue", "red"), lty = 1, cex = 0.7)
+    
+    # Accuracy plot
+    plot(1:length(accuracy_history), accuracy_history, type = "l", col = "blue",
+         ylim = range(c(accuracy_history, val_accuracy_history)),
+         xlab = "Epoch", ylab = "Accuracy", main = "Accuracy")
+    lines(1:length(val_accuracy_history), val_accuracy_history, col = "red")
+    legend("bottomright", legend = c("Train Acc", "Val Acc"), col = c("blue", "red"), lty = 1, cex = 0.7)
+    
+    # Learning Rate plot
+    plot(1:length(lr_history), lr_history, type = "l", col = "purple",
+         xlab = "Epoch", ylab = "Learning Rate", main = "Learning Rate")
+    
+    par(mfrow = c(1, 1))
+    Sys.sleep(0.1)
+  }
+)
+```
+
+Note that eventhough I have clearly defined red, blue and purple as my plot colors, the viewer shows green and blue in the viewer -\> Perhaps an issue with posit cloud.
+
+Defining the training loop
+
+```{r}
+# 5. Model Training with Callbacks
+# --------------------------------
+# Explicitly ensure training mode before fit (Keras does this automatically)
+k_set_learning_phase(1)
+cat("Setting model to TRAINING mode for fit operation\n")
+
+history <- model %>% fit(
+  x = x_train,
+  y = y_train,
+  epochs = 300,           
+  batch_size = 32,        # Use mini-batch training for efficiency.
+  validation_data = list(x_val, y_val),
+  callbacks = list(
+    callback_plot_metrics,
+    lr_scheduler,
+    callback_early_stopping(
+      monitor = "val_loss", patience = 20, restore_best_weights = TRUE
+      )
+    ),
+  verbose = 1
+)
+```
+
+Early stopping was triggered on epoch 227 due to no improvement in validation loss over the last 20 epochs. Accuracy is 88.41%
+
+The plots:
+
+![](images/clipboard-1458437882.png)
+
+```{r}
+# 6. Evaluate Performance on Test Set
+# -----------------------------------
+# Set model to evaluation mode for testing
+k_set_learning_phase(0)
+cat("Setting model to EVALUATION mode for test evaluation\n")
+
+score <- model %>% evaluate(x_test, y_test, verbose = 0)
+cat("Test loss:", score[[1]], "\n")
+cat("Test accuracy:", score[[2]], "\n")
+
+# Generate predictions on the test set (still in evaluation mode)
+cat("Generating predictions for confusion matrix (in evaluation mode)\n")
+predictions <- model %>% predict(x_test)
+predicted_classes <- max.col(predictions) - 1  # zero-indexed
+actual_classes <- max.col(y_test) - 1
+
+# Map encoded classes to actual fault labels
+fault_labels <- levels(target_factor)
+predicted_labels <- fault_labels[predicted_classes + 1]  # adjust for 0-indexing
+actual_labels <- fault_labels[actual_classes + 1]
+
+# Create confusion matrix using caret
+predicted_factor <- factor(predicted_labels, levels = fault_labels)
+actual_factor <- factor(actual_labels, levels = fault_labels)
+conf_matrix <- confusionMatrix(data = predicted_factor, reference = actual_factor)
+```
+
+Plotting the confusion matrix
+
+```{r}
+# 7. Plot Confusion Matrix (Visually Appealing)
+# ---------------------------------------------
+conf_df <- as.data.frame(conf_matrix$table)
+colnames(conf_df) <- c("Predicted", "Actual", "Freq")
+
+ggplot(conf_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  geom_text(aes(label = Freq), color = "black", size = 4) +
+  labs(title = "Confusion Matrix", x = "Actual Fault", y = "Predicted Fault") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+![](images/clipboard-3008093014.png)
+
+Saving the model
+
+```{r}
+# 8. Save the Model
+# -----------------
+# Switch to evaluation mode before saving to ensure proper state
+k_set_learning_phase(0)
+cat("Setting model to EVALUATION mode for saving\n")
+model %>% save_model_tf("mlp_model")
+cat("Model saved successfully in folder 'mlp_model'\n")
+# Restore training mode if further training is planned
+k_set_learning_phase(1)
+cat("Setting model back to TRAINING mode after saving\n")
+```
+
+### Testing the model's robustness and validating its performance
+
+Load the libraries
+
+```{r}
+library(keras)
+library(tensorflow)
+library(caret)
+library(ggplot2)
+
+set.seed(123)
+```
+
+Load and preprocess the data -\> same as done before
+
+```{r}
+data <- read.csv("smote_balanced_TD_features_MLP_V2.csv")
+num_features <- ncol(data) - 1
+features <- data[, 1:num_features]
+target <- data[, ncol(data)]
+features_scaled <- scale(features)
+target_factor <- as.factor(target)
+target_int <- as.integer(target_factor) - 1
+num_classes <- length(levels(target_factor))
+target_onehot <- to_categorical(target_int, num_classes = num_classes)
+```
+
+Create 5 folds
+
+```{r}
+folds <- createFolds(1:nrow(data), k = 5, list = TRUE, returnTrain = FALSE)
+cv_results <- data.frame(Fold = integer(), Test_Accuracy = numeric())
+```
+
+Create the model architecture for validation
+
+```{r}
+# Function to create the model architecture
+create_model <- function() {
+  model <- keras_model_sequential() %>%
+    layer_dense(units = 128, 
+                input_shape = c(num_features),
+                kernel_initializer = initializer_he_normal(),
+                kernel_regularizer = regularizer_l2(0.001)) %>%
+    layer_batch_normalization() %>%
+    layer_activation_leaky_relu(alpha = 0.1) %>%
+    layer_dropout(rate = 0.3) %>%
+    
+    layer_dense(units = 256, 
+                kernel_initializer = initializer_he_normal(),
+                kernel_regularizer = regularizer_l2(0.001)) %>%
+    layer_batch_normalization() %>%
+    layer_activation_leaky_relu(alpha = 0.1) %>%
+    layer_dropout(rate = 0.3) %>%
+    
+    layer_dense(units = 128, 
+                kernel_initializer = initializer_he_normal(),
+                kernel_regularizer = regularizer_l2(0.001)) %>%
+    layer_batch_normalization() %>%
+    layer_activation_leaky_relu(alpha = 0.1) %>%
+    layer_dropout(rate = 0.3) %>%
+    
+    layer_dense(units = 64,
+                kernel_initializer = initializer_he_normal(),
+                kernel_regularizer = regularizer_l2(0.001)) %>%
+    layer_batch_normalization() %>%
+    layer_activation_leaky_relu(alpha = 0.1) %>%
+    
+    layer_dense(units = num_classes, activation = "softmax")
+  
+  loss_obj <- tf$keras$losses$CategoricalCrossentropy(label_smoothing = 0.1)
+  model %>% compile(
+    optimizer = optimizer_adam(learning_rate = 0.001),
+    loss = loss_obj,
+    metrics = c("accuracy")
+  )
+  return(model)
+}
+```
+
+Performing 5 fold cross validation
+
+```{r}
+for(i in 1:5) {
+  cat("Processing fold", i, "\n")
+  
+  test_idx <- folds[[i]]
+  train_idx <- setdiff(1:nrow(data), test_idx)
+  
+  x_train_cv <- features_scaled[train_idx, ]
+  y_train_cv <- target_onehot[train_idx, ]
+  x_test_cv <- features_scaled[test_idx, ]
+  y_test_cv <- target_onehot[test_idx, ]
+  
+  # Create a fresh model for each fold
+  model_cv <- create_model()
+  
+  # Train the model (validation split can be taken from training data)
+  history <- model_cv %>% fit(
+    x = x_train_cv,
+    y = y_train_cv,
+    epochs = 100,      # You can adjust epochs
+    batch_size = 32,
+    validation_split = 0.1,
+    verbose = 0
+  )
+  
+  # Set model to evaluation mode for evaluation
+  k_set_learning_phase(0)
+  score <- model_cv %>% evaluate(x_test_cv, y_test_cv, verbose = 0)
+  k_set_learning_phase(1)
+  
+  cat("Fold", i, "Test Accuracy:", score[[2]], "\n")
+  cv_results <- rbind(cv_results, data.frame(Fold = i, Test_Accuracy = score[[2]]))
+}
+```
+
+```         
+Processing fold 1
+Fold 1 Test Accuracy: 0.8489209 
+Processing fold 2  
+Fold 2 Test Accuracy: 0.8043478  
+Processing fold 3  
+Fold 3 Test Accuracy: 0.8550724  
+Processing fold 4  
+Fold 4 Test Accuracy: 0.8175182  
+Processing fold 5  
+Fold 5 Test Accuracy: 0.8057554
+```
+
+Cross validation results
+
+```{r}
+# Display cross validation results
+print(cv_results)
+cat("Average Test Accuracy:", mean(cv_results$Test_Accuracy), "\n")
+```
+
+```         
+Average Test Accuracy: 0.8263229  
+```
+
+Plotting the accuracy for each fold
+
+```{r}
+ggplot(cv_results, aes(x = factor(Fold), y = Test_Accuracy)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "5-Fold Cross Validation Accuracy", x = "Fold", y = "Test Accuracy") +
+  theme_minimal()
+```
+
+![](images/clipboard-4265754398.png)
+
+**Cross-Validation Results and Generalization Performance**
+
+To evaluate the robustness and generalization ability of the trained neural network model, we conducted **5-fold cross-validation** on the training data and compared the results to the final performance on the held-out test set.
+
+**Cross-Validation Accuracy**
+
+The model achieved an average **cross-validation accuracy of 82%**, indicating that it consistently performed well across multiple subsets of the data. This suggests that the model is learning patterns that generalize reasonably well to unseen data within the training distribution.
+
+**Test Set Accuracy**
+
+When evaluated on the completely separate **test set**, the model achieved a final **accuracy of 87%**. This higher performance on the test set may indicate one or more of the following:
+
+1.  The model benefited from additional exposure to the full training set during final training (after cross-validation).
+2.  The test set may have been slightly easier to classify than certain validation folds.
+
+The model exhibits **decent generalization**, with no clear signs of overfitting, since the test performance is not dramatically different from cross-validation accuracy.
+
+### Summary
+
+| Metric                         | Value  |
+|--------------------------------|--------|
+| Mean Cross-Validation Accuracy | 82.63% |
+| Final Test Set Accuracy        | 87.14% |
+
+These results demonstrate that the model has learned to effectively differentiate between fault classes and is likely to generalize well to real-world inputs.
+
+### Load and sample from the model
+
+Below is a sample script that can be used to do inference by loading the model and feeding a single training example to it to obtain a diagnosis.
+
+```{r}
+library(keras)
+library(tensorflow)
+
+# Load additional libraries if needed
+library(ggplot2)  # Optional: for plotting
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Function to load the saved model
+load_mlp_model <- function(model_path = "mlp_model") {
+  # Ensure the model is loaded in evaluation mode
+  k_set_learning_phase(0)
+  model <- load_model_tf(model_path)
+  cat("Model loaded from", model_path, "\n")
+  return(model)
+}
+
+# Load the saved model
+model_loaded <- load_mlp_model("mlp_model")
+
+# Function to preprocess a new sample
+preprocess_sample <- function(sample, features_scaled) {
+  centers <- attr(features_scaled, "scaled:center")
+  scales <- attr(features_scaled, "scaled:scale")
+  sample_scaled <- (sample - centers) / scales
+  sample_matrix <- matrix(sample_scaled, nrow = 1)
+  return(sample_matrix)
+}
+
+# Example: Load a new sample from file or create one manually.
+# For demonstration, we assume the sample is a numeric vector of length equal to num_features.
+# (You may need to load your sample data similarly to the training data.)
+
+# Example sample (replace with your actual sample data)
+sample_example <- rep(0, ncol(features_scaled))  # Dummy sample; replace with real data
+
+# Preprocess the sample using the same scaling parameters saved in memory.
+# In practice, you might want to save/load these parameters along with your model.
+sample_matrix <- preprocess_sample(sample_example, features_scaled)
+
+# Generate prediction (model is already in evaluation mode)
+prediction <- model_loaded %>% predict(sample_matrix)
+predicted_class <- which.max(prediction) - 1
+
+# fault_labels <- c("Fault_A", "Fault_B", "Fault_C", ...)  (replace with actual labels)
+# cat("Predicted Fault Label:", fault_labels[predicted_class + 1], "\n")
+cat("Predicted class (encoded):", predicted_class, "\n")
+```
+
+## Project Conclusion
+
+Fault diagnosis in analog electronic circuits remains a significant real-world challenge, particularly in scenarios where early detection and classification of faults can prevent system failures and improve reliability. This project addresses the problem by leveraging machine learning techniques to automate and enhance the diagnostic process.
+
+The dataset used in this study was synthetically generated through extensive simulations conducted in **Multisim**, capturing a diverse range of fault conditions and normal operational behavior. A comprehensive preprocessing pipeline was developed in **R**, involving standardization, categorical encoding, and statistical validation of feature relevance through ANOVA.
+
+Initial prototyping of the diagnostic model was carried out using **R's Keras and TensorFlow interface**, where a multi-layer perceptron (MLP) was trained and evaluated. This prototype served as a robust baseline and demonstrated promising results, validating the feasibility of the approach.
+
+Building upon these findings, the final model was re-implemented in **PyTorch**, allowing for greater flexibility, improved control over model architecture, and more advanced deployment options. The PyTorch-based model achieved superior performance, with a final **accuracy of 90% (Test and Cross validation)**, and was deployed as a **web application on Hugging Face Spaces**. This application includes an intuitive interface that allows users to upload **raw waveform data in Excel or CSV format**, after which the app automatically **interpolates, extracts, and engineers features**, and produces a diagnostic prediction using the trained model.
+
+The end-to-end pipeline—from simulation and data preprocessing, to deep learning model development and real-time deployment—demonstrates the power of combining domain knowledge with machine learning to solve critical engineering problems. This project not only showcases the technical feasibility of AI-assisted fault diagnosis but also provides a deployable solution that can be extended for use in practical, industrial settings.\
+\
+The repository for the other models (Coded in Python -\> Pytorch , Scikitlearn) is: <https://github.com/Shaurya-Sethi/fault-diagnosis-docs>
+
+\
+And the app is hosted here: <https://huggingface.co/spaces/Shaurya-Sethi/fault-diagnosis>
